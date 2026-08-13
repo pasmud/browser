@@ -2826,6 +2826,7 @@ pub const Transfer = struct {
         for (self.client.baselineHeaders()) |hdr| {
             try self.addHeader(hdr.name, hdr.value, .{ .source = hdr.source });
         }
+
         // --http-header extras; setHeader so a same-name header (e.g.
         // Accept-Language) overrides the baseline instead of duplicating.
         for (self.client.network.config.httpHeaders()) |hdr| {
@@ -3530,7 +3531,7 @@ test "HttpClient: seedHeaders applies --http-header extras with override" {
     var pool = ArenaPool.init(testing.allocator, .{});
     defer pool.deinit();
 
-    var extra_headers: std.ArrayList(lp.Config.HttpHeader) = .empty;
+    var extra_headers: std.ArrayList(http.Header) = .empty;
     defer extra_headers.deinit(testing.allocator);
     try extra_headers.append(testing.allocator, .{ .name = "x-extra", .value = "1" });
     try extra_headers.append(testing.allocator, .{ .name = "accept-language", .value = "fr-FR" });
