@@ -2826,6 +2826,11 @@ pub const Transfer = struct {
         for (self.client.baselineHeaders()) |hdr| {
             try self.addHeader(hdr.name, hdr.value, .{ .source = hdr.source });
         }
+        // --http-header extras; setHeader so a same-name header (e.g.
+        // Accept-Language) overrides the baseline instead of duplicating.
+        for (self.client.network.config.httpHeaders()) |hdr| {
+            try self.setHeader(hdr.name, hdr.value, .{});
+        }
     }
 
     // CDP Fetch.continueRequest: the intercepting client supplies the
@@ -3519,6 +3524,64 @@ test "HttpClient: Transfer.setHeader replaces by case-insensitive name" {
     try testing.expectEqual(.author, headers[1].source);
     try testing.expectEqual("X-New", headers[2].name);
     try testing.expectEqual("yes", headers[2].value);
+}
+
+test "HttpClient: seedHeaders applies --http-header extras with override" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    var extra_headers: std.ArrayList(lp.Config.HttpHeader) = .empty;
+    defer extra_headers.deinit(testing.allocator);
+    try extra_headers.append(testing.allocator, .{ .name = "x-extra", .value = "1" });
+    try extra_headers.append(testing.allocator, .{ .name = "accept-language", .value = "fr-FR" });
+
+    var config = try lp.Config.init(testing.allocator, "test", .{ .serve = .{
+        .http_header = extra_headers,
+    } });
+    defer config.deinit(testing.allocator);
+
+    var network: Network = undefined;
+    network.config = &config;
+
+    var client: Client = undefined;
+    initTestClient(&client, &pool);
+    client.network = &network;
+    client.user_agent_override = null;
+
+    const arena = try pool.acquire(.small, "test");
+    defer arena.release();
+
+    var transfer = Transfer{
+        .arena = arena,
+        .owner = null,
+        .req = .{
+            .frame_id = 0,
+            .loader_id = 0,
+            .method = .GET,
+            .url = "http://example.com/",
+            .cookie_jar = null,
+            .cookie_origin = "",
+            .resource_type = .document,
+            .notification = undefined,
+            .shutdown_callback = noopShutdown,
+        },
+        .client = &client,
+        .id = 1,
+        .start_time = 0,
+    };
+
+    try transfer.seedHeaders();
+
+    const headers = transfer.req_headers.items;
+    try testing.expectEqual(4, headers.len);
+    try testing.expectEqual("User-Agent", headers[0].name);
+    try testing.expectEqual("Sec-Ch-Ua", headers[1].name);
+    // Baseline Accept-Language replaced in place by the CLI header.
+    try testing.expectEqual("Accept-Language", headers[2].name);
+    try testing.expectEqual("fr-FR", headers[2].value);
+    try testing.expectEqual(.user_agent, headers[2].source);
+    try testing.expectEqual("x-extra", headers[3].name);
+    try testing.expectEqual("1", headers[3].value);
 }
 
 test "HttpClient: Transfer.appendHeader joins values by case-insensitive name" {

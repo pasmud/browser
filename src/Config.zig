@@ -85,6 +85,36 @@ fn logLevelValidator(_: Allocator, args: *std.process.Args.Iterator, target: *?l
     };
 }
 
+pub const HttpHeader = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+// "Name: Value" -> HttpHeader. Splits on the first ':' and trims optional
+// whitespace. Rejects empty names, CR/LF (header injection) and User-Agent
+// (reserved for --user-agent).
+fn parseHttpHeader(str: []const u8) error{ InvalidHeader, ForbiddenHeader }!HttpHeader {
+    const colon = std.mem.indexOfScalar(u8, str, ':') orelse return error.InvalidHeader;
+    const name = std.mem.trim(u8, str[0..colon], " \t");
+    if (name.len == 0) return error.InvalidHeader;
+    if (std.mem.indexOfAny(u8, str, "\r\n") != null) return error.InvalidHeader;
+    if (std.ascii.eqlIgnoreCase(name, "user-agent")) return error.ForbiddenHeader;
+    return .{ .name = name, .value = std.mem.trim(u8, str[colon + 1 ..], " \t") };
+}
+
+fn httpHeaderValidator(allocator: Allocator, args: *std.process.Args.Iterator, list: *std.ArrayList(HttpHeader)) !void {
+    const str = args.next() orelse return error.MissingArgument;
+    const header = parseHttpHeader(str) catch |err| {
+        const hint = switch (err) {
+            error.ForbiddenHeader => "use --user-agent to change the User-Agent",
+            error.InvalidHeader => "expected \"Name: Value\"",
+        };
+        log.fatal(.app, "invalid option value", .{ .arg = "--http-header", .value = str, .hint = hint });
+        return error.InvalidArgument;
+    };
+    try list.append(allocator, header);
+}
+
 const Cert = struct {
     /// On successful CLI argument parsing phase, ownership of this transferred
     /// to `Network`. Consider it as invalid.
@@ -183,6 +213,7 @@ const CommonOptions = .{
     .{ .name = "http_max_host_open", .type = ?u8 },
     .{ .name = "http_timeout", .type = ?u31 },
     .{ .name = "http_connect_timeout", .type = ?u31 },
+    .{ .name = "http_header", .type = HttpHeader, .multiple = true, .validator = httpHeaderValidator },
     .{ .name = "http_max_response_size", .type = ?usize },
     .{ .name = "ws_max_concurrent", .type = ?u8 },
     .{ .name = "insecure_disable_tls_host_verification", .type = bool },
@@ -504,6 +535,13 @@ pub fn httpProxy(self: *const Config) ?[:0]const u8 {
         inline .serve, .fetch, .mcp, .agent => |opts| opts.http_proxy,
         .version => null,
         else => unreachable,
+    };
+}
+
+pub fn httpHeaders(self: *const Config) []const HttpHeader {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_header.items,
+        else => &.{},
     };
 }
 
@@ -1063,6 +1101,55 @@ test "Config: validateUserAgent" {
     try std.testing.expectError(error.Reserved, validateUserAgent("mozilla/1.0"));
     try std.testing.expectError(error.Reserved, validateUserAgent("Mozilla/5.0"));
     try std.testing.expectError(error.NonPrintable, validateUserAgent("bad\x01ua"));
+}
+
+test "Config: parseHttpHeader splits and validates" {
+    {
+        const hdr = try parseHttpHeader("X-Foo: bar");
+        try std.testing.expectEqualStrings("X-Foo", hdr.name);
+        try std.testing.expectEqualStrings("bar", hdr.value);
+    }
+    {
+        const hdr = try parseHttpHeader("  X-Foo\t:  bar baz  ");
+        try std.testing.expectEqualStrings("X-Foo", hdr.name);
+        try std.testing.expectEqualStrings("bar baz", hdr.value);
+    }
+    {
+        // Empty value is allowed; the value may itself contain a colon.
+        const hdr = try parseHttpHeader("Referer: http://example.com/");
+        try std.testing.expectEqualStrings("Referer", hdr.name);
+        try std.testing.expectEqualStrings("http://example.com/", hdr.value);
+        try std.testing.expectEqualStrings("", (try parseHttpHeader("X-Empty:")).value);
+    }
+    try std.testing.expectError(error.InvalidHeader, parseHttpHeader("no-colon"));
+    try std.testing.expectError(error.InvalidHeader, parseHttpHeader(": value"));
+    try std.testing.expectError(error.InvalidHeader, parseHttpHeader("X-A: a\r\nEvil: b"));
+    // User-Agent is reserved for --user-agent, whatever the case.
+    try std.testing.expectError(error.ForbiddenHeader, parseHttpHeader("User-Agent: Custom/1.0"));
+    try std.testing.expectError(error.ForbiddenHeader, parseHttpHeader("user-agent: Custom/1.0"));
+}
+
+test "Config: httpHeaders accessor" {
+    {
+        var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{} });
+        defer config.deinit(std.testing.allocator);
+        try std.testing.expectEqual(0, config.httpHeaders().len);
+    }
+    {
+        var list: std.ArrayList(HttpHeader) = .empty;
+        defer list.deinit(std.testing.allocator);
+        try list.append(std.testing.allocator, try parseHttpHeader("X-Extra: 1"));
+
+        var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+            .http_header = list,
+        } });
+        defer config.deinit(std.testing.allocator);
+
+        const headers = config.httpHeaders();
+        try std.testing.expectEqual(1, headers.len);
+        try std.testing.expectEqualStrings("X-Extra", headers[0].name);
+        try std.testing.expectEqualStrings("1", headers[0].value);
+    }
 }
 
 fn userAgentValidator(allocator: Allocator, args: *std.process.Args.Iterator, ua: *?[]const u8) !void {

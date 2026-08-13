@@ -352,6 +352,9 @@
     \\          Time in ms to establish an HTTP connection before timing out. 0 means
     \\          never.
     \\          Defaults to 0.
+    \\  --http-header <HEADER>
+    \\          Extra header added to every outgoing HTTP request, in
+    \\          "Name: Value" form. Can be passed multiple times.
     \\  --http-max-concurrent <INT>
     \\          Maximum number of concurrent HTTP requests.
     \\          Defaults to 40.
