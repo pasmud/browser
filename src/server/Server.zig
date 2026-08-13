@@ -20,11 +20,14 @@ const std = @import("std");
 const lp = @import("lightpanda");
 const builtin = @import("builtin");
 
-const App = @import("App.zig");
-const Config = @import("Config.zig");
+const App = @import("../App.zig");
+const Config = @import("../Config.zig");
+const sys_net = @import("../sys/net.zig");
 
 const CDP = @import("cdp/CDP.zig");
-const sys_net = @import("sys/net.zig");
+const BiDi = @import("bidi/BiDi.zig");
+const Handshake = @import("Handshake.zig");
+const Driver = @import("Driver.zig");
 
 const log = lp.log;
 const posix = std.posix;
@@ -36,14 +39,15 @@ app: *App,
 max_connections: usize,
 json_version_response: []const u8,
 
-// Number of active CDP conns, used to enforce the cdp-max-connections limit.
+driver_mutex: std.Io.Mutex = .init,
+drivers: std.ArrayList(Driver) = .empty,
+
+// Number of active conns, used to enforce the cdp-max-connections limit.
 active_conns: std.atomic.Value(u32) = .init(0),
 // Number of existing threads, used to deinit correctly.
 // It can be higher than active_conns b/c we free conn slots early.
 active_threads: std.atomic.Value(u32) = .init(0),
 
-cdps: std.ArrayList(*CDP) = .empty,
-cdp_mutex: std.Io.Mutex = .init,
 cdp_pool: std.heap.MemoryPool(CDP),
 
 pub fn init(app: *App, address: sys_net.IpAddress) !*Server {
@@ -68,19 +72,13 @@ pub fn init(app: *App, address: sys_net.IpAddress) !*Server {
 }
 
 pub fn shutdown(self: *Server) void {
-    self.cdp_mutex.lockUncancelable(lp.io);
-    defer self.cdp_mutex.unlock(lp.io);
+    self.driver_mutex.lockUncancelable(lp.io);
+    defer self.driver_mutex.unlock(lp.io);
 
     self.app.network.unbind();
 
-    for (self.cdps.items) |cdp| {
-        if (cdp.conn.state == .live) {
-            cdp.browser.env.terminate();
-            // We use to send a nice WS close frame here but (a) it isn't
-            // strictly required and (b) we'd have to protect against an interleaved
-            // write from the worker thread.
-        }
-        cdp.conn.shutdown();
+    for (self.drivers.items) |*driver| {
+        driver.shutdown();
     }
 }
 
@@ -92,7 +90,7 @@ pub fn deinit(self: *Server) void {
     }
 
     const allocator = self.app.allocator;
-    self.cdps.deinit(allocator);
+    self.drivers.deinit(allocator);
     self.cdp_pool.deinit(allocator);
     self.app.allocator.free(self.json_version_response);
     self.app.allocator.destroy(self);
@@ -190,91 +188,101 @@ fn handleConnection(self: *Server, socket: posix.socket_t) void {
     defer _ = self.active_threads.fetchSub(1, .monotonic);
     defer _ = std.c.close(socket);
 
+    const route = Handshake.run(self.app, socket, self.json_version_response) orelse return;
+    switch (route) {
+        .cdp => self.serveCDP(socket, &active_conns_early_release),
+        .bidi => self.serveBiDi(socket, &active_conns_early_release),
+    }
+}
+
+// The socket is an upgraded websocket speaking CDP.
+fn serveCDP(self: *Server, socket: posix.socket_t, active_conns_early_release: *bool) void {
     const cdp = blk: {
         const allocator = self.app.allocator;
-        self.cdp_mutex.lockUncancelable(lp.io);
-        defer self.cdp_mutex.unlock(lp.io);
+        self.driver_mutex.lockUncancelable(lp.io);
+        defer self.driver_mutex.unlock(lp.io);
         break :blk self.cdp_pool.create(allocator) catch @panic("OOM");
     };
     defer {
-        self.cdp_mutex.lockUncancelable(lp.io);
-        defer self.cdp_mutex.unlock(lp.io);
+        self.driver_mutex.lockUncancelable(lp.io);
+        defer self.driver_mutex.unlock(lp.io);
         self.cdp_pool.destroy(cdp);
     }
 
-    cdp.init(self.app, socket, self.json_version_response) catch |err| {
+    cdp.init(self.app, socket) catch |err| {
         log.err(.app, "CDP init", .{ .err = err });
         return;
     };
     defer cdp.deinit();
 
-    if (log.enabled(.app, .info)) {
-        const client_address = cdp.conn.getAddress() catch null;
-        log.info(.app, "client connected", .{ .ip = client_address });
-    }
-
-    {
-        // track the connection
-        self.cdp_mutex.lockUncancelable(lp.io);
-        defer self.cdp_mutex.unlock(lp.io);
-        self.cdps.append(self.app.allocator, cdp) catch {};
-    }
-
-    defer {
-        // untrack the connection
-        self.cdp_mutex.lockUncancelable(lp.io);
-        defer self.cdp_mutex.unlock(lp.io);
-        for (self.cdps.items, 0..) |c, i| {
-            if (c == cdp) {
-                _ = self.cdps.swapRemove(i);
-                break;
-            }
-        }
-    }
-
-    const upgraded = cdp.conn.handshake() catch |err| {
-        log.err(.app, "CDP handshake", .{ .err = err });
-        return;
-    };
-
-    if (!upgraded) {
-        return;
-    }
-
-    // only count websocket (i.e. CDP) connections, not HTTP requests like
-    // /json/version probes or /metrics scrapes
+    // Only CDP connections are counted: the metric names are part of the
+    // scrape contract, and there are no bidi_* equivalents yet.
     lp.metrics.cdp_connections.incr();
     lp.metrics.cdp_active_connections.incr();
     defer lp.metrics.cdp_active_connections.decr();
 
-    {
-        // Transition from .handshake state to .live
-        // Lock needed even though the main thread hasn't seen this yet because
-        // shutdown could access this from the sighandler thread.
-        self.cdp_mutex.lockUncancelable(lp.io);
-        defer self.cdp_mutex.unlock(lp.io);
-        cdp.conn.state = .live;
+    self.serve(.init(.{ .cdp = cdp }), active_conns_early_release);
+}
+
+// The socket is an upgraded websocket speaking WebDriver BiDi.
+fn serveBiDi(self: *Server, socket: posix.socket_t, active_conns_early_release: *bool) void {
+    const allocator = self.app.allocator;
+
+    // heap-allocated: BiDi embeds a Browser
+    const bidi = allocator.create(BiDi) catch @panic("OOM");
+    defer allocator.destroy(bidi);
+
+    bidi.init(self.app, socket) catch |err| {
+        log.err(.app, "BiDi init", .{ .err = err });
+        return;
+    };
+    defer bidi.deinit();
+
+    self.serve(.init(.{ .bidi = bidi }), active_conns_early_release);
+}
+
+// Everything a live connection needs regardless of which protocol it
+// speaks: tracking (so shutdown can reach it), handing the read side to
+// the Network thread, and running the worker loop.
+fn serve(self: *Server, driver: Driver, active_conns_early_release: *bool) void {
+    const conn = driver.conn;
+
+    if (log.enabled(.app, .info)) {
+        const client_address = getClientAddress(conn.socket) catch null;
+        log.info(.app, "client connected", .{ .ip = client_address });
     }
 
-    // Hand the read side of the CDP socket over to the Network thread.
-    // From here until the matching unregisterCdp, the worker must NOT
+    self.track(driver);
+    defer self.untrack(driver);
+
+    {
+        // Transition from .starting state to .live
+        // Lock needed even though the main thread hasn't seen this yet because
+        // shutdown could access this from the sighandler thread.
+        self.driver_mutex.lockUncancelable(lp.io);
+        defer self.driver_mutex.unlock(lp.io);
+        conn.state = .live;
+    }
+
+    // Hand the read side of the socket over to the Network thread.
+    // From here until the matching unregisterClient, the worker must NOT
     // read from the socket directly — bytes arrive via the inbox.
-    // unregisterCdp is synchronous, so by the time it returns Network
+    // unregisterClient is synchronous, so by the time it returns Network
     // is guaranteed to be done with this link.
     //
-    // cdp_link_active gates HttpClient.perform's block in
+    // driver_link_active gates HttpClient.perform's block in
     // curl_multi_poll: with it false (tests, pre-handshake), perform
     // skips the poll when there's no in-flight curl work — sleeping
     // would just eat the timeout waiting for a wakeup that won't
-    // come. We set it true *after* registerCdp so Network is already
+    // come. We set it true *after* registerClient so Network is already
     // accepting wakeups by the time the worker might poll, and clear
-    // it *after* unregisterCdp returns (Network is guaranteed done
+    // it *after* unregisterClient returns (Network is guaranteed done
     // with us by then).
-    self.app.network.registerCdp(&cdp.link);
-    cdp.browser.http_client.cdp_link_active = true;
+    self.app.network.registerClient(driver.link);
+    driver.browser.http_client.driver_link_active = true;
     defer {
-        self.app.network.unregisterCdp(&cdp.link);
-        cdp.browser.http_client.cdp_link_active = false;
+        self.app.network.unregisterClient(driver.link);
+        driver.browser.http_client.driver_link_active = false;
     }
 
     // Check shutdown after markLive so that a concurrent shutdown either
@@ -284,19 +292,42 @@ fn handleConnection(self: *Server, socket: posix.socket_t) void {
         return;
     }
 
-    while (true) {
-        const next = cdp.tick() catch |err| {
-            log.err(.app, "cdp tick", .{ .err = err });
-            return;
-        };
-        if (!next) break;
-    }
+    driver.run();
 
-    // try to release the connection as soon as possible.
-    active_conns_early_release = true;
+    // Try to release the connection as soon as possible: the browser/V8
+    // teardown in our callers' defers can take milliseconds, and a client
+    // that disconnects and immediately reconnects shouldn't be rejected
+    // for a slot we're merely unwinding.
+    active_conns_early_release.* = true;
     _ = self.active_conns.fetchSub(1, .monotonic);
 }
 
+fn track(self: *Server, driver: Driver) void {
+    self.driver_mutex.lockUncancelable(lp.io);
+    defer self.driver_mutex.unlock(lp.io);
+    self.drivers.append(self.app.allocator, driver) catch {};
+}
+
+fn untrack(self: *Server, driver: Driver) void {
+    self.driver_mutex.lockUncancelable(lp.io);
+    defer self.driver_mutex.unlock(lp.io);
+
+    for (self.drivers.items, 0..) |*d, i| {
+        if (d.conn == driver.conn) {
+            _ = self.drivers.swapRemove(i);
+            break;
+        }
+    }
+}
+
+fn getClientAddress(socket: posix.socket_t) !sys_net.IpAddress {
+    var storage: posix.sockaddr.storage = undefined;
+    var socklen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    try posix.getpeername(socket, @ptrCast(&storage), &socklen);
+    return sys_net.addressFromSockaddr(@ptrCast(&storage));
+}
+
+// The pointed-to driver is owned by its worker thread
 fn buildJSONVersionResponse(app: *const App, port: u16) ![]const u8 {
     const host = app.config.advertiseHost();
     if (app.config.bindIsWildcard()) {
@@ -333,7 +364,7 @@ fn buildJSONVersionResponse(app: *const App, port: u16) ![]const u8 {
     return try std.fmt.allocPrint(app.allocator, response_format, .{ body_len, host, port });
 }
 
-const testing = @import("testing.zig");
+const testing = @import("../testing.zig");
 test "server: buildJSONVersionResponse" {
     const res = try buildJSONVersionResponse(testing.test_app, testing.test_app.config.port());
     defer testing.test_app.allocator.free(res);
@@ -627,6 +658,216 @@ test "Client: close message" {
     );
 }
 
+test "server: bidi session lifecycle" {
+    var c = try createTestClient();
+    defer c.deinit();
+    try c.handshake("/session");
+
+    try c.bidiCommand("{\"id\":1,\"method\":\"session.status\"}");
+    try assertBidiMessage(&c, .{ .type = "success", .id = 1, .result = .{ .ready = true, .message = "" } });
+
+    // capture the sessionId from session.new by hand — it's random
+    try c.bidiCommand("{\"id\":2,\"method\":\"session.new\",\"params\":{\"capabilities\":{}}}");
+    {
+        const msg = try c.readWebsocketMessage() orelse return error.NoMessage;
+        defer if (msg.cleanup_fragment) c.reader.cleanup();
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, msg.data, .{});
+        defer parsed.deinit();
+
+        const obj = parsed.value.object;
+        try testing.expectEqual("success", obj.get("type").?.string);
+        try testing.expectEqual(2, obj.get("id").?.integer);
+
+        const result = obj.get("result").?.object;
+        try testing.expectEqual(36, result.get("sessionId").?.string.len);
+
+        const capabilities = result.get("capabilities").?.object;
+        try testing.expectEqual("Lightpanda", capabilities.get("browserName").?.string);
+        try testing.expectEqual(lp.build_config.version, capabilities.get("browserVersion").?.string);
+        try testing.expectEqual(false, capabilities.get("acceptInsecureCerts").?.bool);
+    }
+
+    try c.bidiCommand("{\"id\":3,\"method\":\"session.status\"}");
+    try assertBidiMessage(&c, .{ .type = "success", .id = 3, .result = .{ .ready = false, .message = "session already started" } });
+
+    try c.bidiCommand("{\"id\":4,\"method\":\"session.new\"}");
+    try assertBidiMessage(&c, .{ .type = "error", .id = 4, .@"error" = "session not created", .message = "session already exists" });
+
+    try c.bidiCommand("{\"id\":5,\"method\":\"session.subscribe\",\"params\":{\"events\":[\"log.entryAdded\"]}}");
+    {
+        // the subscription id is random
+        const msg = try c.readWebsocketMessage() orelse return error.NoMessage;
+        defer if (msg.cleanup_fragment) c.reader.cleanup();
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, msg.data, .{});
+        defer parsed.deinit();
+        try testing.expectEqual("success", parsed.value.object.get("type").?.string);
+        try testing.expectEqual(36, parsed.value.object.get("result").?.object.get("subscription").?.string.len);
+    }
+
+    try c.bidiCommand("{\"id\":6,\"method\":\"session.unsubscribe\",\"params\":{\"events\":[\"log.entryAdded\"]}}");
+    // an empty result must serialize as {}, not [] — struct {}{} on the
+    // expected side asserts the object-ness
+    try assertBidiMessage(&c, .{ .type = "success", .id = 6, .result = struct {}{} });
+
+    try c.bidiCommand("{\"id\":7,\"method\":\"session.end\"}");
+    try assertBidiMessage(&c, .{ .type = "success", .id = 7, .result = struct {}{} });
+
+    // ending the session closes the connection
+    {
+        const msg = try c.readWebsocketMessage() orelse return error.NoMessage;
+        defer if (msg.cleanup_fragment) c.reader.cleanup();
+        try testing.expectEqual(.close, msg.type);
+    }
+}
+
+test "server: bidi errors" {
+    var c = try createTestClient();
+    defer c.deinit();
+    try c.handshake("/session");
+
+    try c.bidiCommand("this is not json");
+    try assertBidiMessage(&c, .{ .type = "error", .id = null, .@"error" = "invalid argument", .message = "invalid JSON message" });
+
+    try c.bidiCommand("{\"method\":\"session.status\"}");
+    try assertBidiMessage(&c, .{ .type = "error", .id = null, .@"error" = "invalid argument", .message = "missing command id" });
+
+    try c.bidiCommand("{\"id\":1}");
+    try assertBidiMessage(&c, .{ .type = "error", .id = 1, .@"error" = "invalid argument", .message = "missing command method" });
+
+    try c.bidiCommand("{\"id\":2,\"method\":\"browsingContext.getTree\"}");
+    try assertBidiMessage(&c, .{ .type = "error", .id = 2, .@"error" = "invalid session id", .message = "no active session" });
+
+    // session-scoped commands before session.new
+    try c.bidiCommand("{\"id\":3,\"method\":\"session.subscribe\"}");
+    try assertBidiMessage(&c, .{ .type = "error", .id = 3, .@"error" = "invalid session id", .message = "no active session" });
+
+    try c.bidiCommand("{\"id\":4,\"method\":\"session.end\"}");
+    try assertBidiMessage(&c, .{ .type = "error", .id = 4, .@"error" = "invalid session id", .message = "no active session" });
+
+    // an unknown command is reported as such even before session.new; only
+    // known commands in known modules reach the session gate
+    try c.bidiCommand("{\"id\":5,\"method\":\"session.over9000\"}");
+    try assertBidiMessage(&c, .{ .type = "error", .id = 5, .@"error" = "unknown command", .message = "session.over9000" });
+
+    try c.bidiCommand("{\"id\":6,\"method\":\"storage.getCookies\"}");
+    try assertBidiMessage(&c, .{ .type = "error", .id = 6, .@"error" = "unknown command", .message = "storage.getCookies" });
+
+    try c.bidiCommand("{\"id\":7,\"method\":\"nodothere\"}");
+    try assertBidiMessage(&c, .{ .type = "error", .id = 7, .@"error" = "unknown command", .message = "nodothere" });
+}
+
+test "server: bidi browsingContext" {
+    var c = try createTestClient();
+    defer c.deinit();
+    try c.handshake("/session");
+
+    try c.bidiCommand("{\"id\":1,\"method\":\"session.new\",\"params\":{\"capabilities\":{}}}");
+    try discardBidiMessage(&c); // response shape covered by the lifecycle test
+
+    var context_id: [36]u8 = undefined;
+    try c.bidiCommand("{\"id\":2,\"method\":\"browsingContext.create\",\"params\":{\"type\":\"tab\"}}");
+    {
+        const msg = try c.readWebsocketMessage() orelse return error.NoMessage;
+        defer if (msg.cleanup_fragment) c.reader.cleanup();
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, msg.data, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        try testing.expectEqual("success", obj.get("type").?.string);
+        const context = obj.get("result").?.object.get("context").?.string;
+        try testing.expectEqual(36, context.len);
+        @memcpy(&context_id, context);
+    }
+
+    try c.bidiCommand("{\"id\":3,\"method\":\"browsingContext.getTree\"}");
+    try assertBidiMessage(&c, .{ .type = "success", .id = 3, .result = .{ .contexts = .{.{
+        .context = &context_id,
+        .url = "about:blank",
+        .userContext = "default",
+        .originalOpener = null,
+        .children = .{},
+    }} } });
+
+    try c.bidiCommand("{\"id\":4,\"method\":\"session.subscribe\",\"params\":{\"events\":[\"browsingContext.domContentLoaded\",\"browsingContext.load\"]}}");
+    try discardBidiMessage(&c);
+
+    const url = "http://127.0.0.1:9582/src/browser/tests/cdp/dom2.html";
+    var buf: [256]u8 = undefined;
+    try c.bidiCommand(try std.fmt.bufPrint(
+        &buf,
+        "{{\"id\":5,\"method\":\"browsingContext.navigate\",\"params\":{{\"context\":\"{s}\",\"url\":\"" ++ url ++ "\",\"wait\":\"complete\"}}}}",
+        .{&context_id},
+    ));
+    try assertBidiEvent(&c, "browsingContext.domContentLoaded", &context_id, url);
+    try assertBidiEvent(&c, "browsingContext.load", &context_id, url);
+    {
+        const msg = try c.readWebsocketMessage() orelse return error.NoMessage;
+        defer if (msg.cleanup_fragment) c.reader.cleanup();
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, msg.data, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        try testing.expectEqual("success", obj.get("type").?.string);
+        try testing.expectEqual(5, obj.get("id").?.integer);
+        const result = obj.get("result").?.object;
+        try testing.expectEqual(url, result.get("url").?.string);
+        try testing.expectEqual(36, result.get("navigation").?.string.len);
+    }
+
+    try c.bidiCommand("{\"id\":6,\"method\":\"browsingContext.navigate\",\"params\":{\"context\":\"00000000-0000-0000-0000-000000000000\",\"url\":\"about:blank\"}}");
+    try assertBidiMessage(&c, .{ .type = "error", .id = 6, .@"error" = "no such frame", .message = "unknown context" });
+
+    try c.bidiCommand("{\"id\":7,\"method\":\"browsingContext.create\",\"params\":{\"type\":\"tab\"}}");
+    try assertBidiMessage(&c, .{ .type = "error", .id = 7, .@"error" = "unsupported operation" });
+
+    try c.bidiCommand(try std.fmt.bufPrint(
+        &buf,
+        "{{\"id\":8,\"method\":\"browsingContext.close\",\"params\":{{\"context\":\"{s}\"}}}}",
+        .{&context_id},
+    ));
+    try assertBidiMessage(&c, .{ .type = "success", .id = 8, .result = struct {}{} });
+
+    try c.bidiCommand("{\"id\":9,\"method\":\"browsingContext.getTree\"}");
+    try assertBidiMessage(&c, .{ .type = "success", .id = 9, .result = .{ .contexts = .{} } });
+}
+
+fn discardBidiMessage(c: *TestClient) !void {
+    const msg = try c.readWebsocketMessage() orelse return error.NoMessage;
+    if (msg.cleanup_fragment) {
+        c.reader.cleanup();
+    }
+}
+
+fn assertBidiEvent(c: *TestClient, method: []const u8, context: []const u8, url: []const u8) !void {
+    const msg = try c.readWebsocketMessage() orelse return error.NoMessage;
+    defer if (msg.cleanup_fragment) {
+        c.reader.cleanup();
+    };
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, msg.data, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqual("event", obj.get("type").?.string);
+    try testing.expectEqual(method, obj.get("method").?.string);
+
+    const p = obj.get("params").?.object;
+    try testing.expectEqual(context, p.get("context").?.string);
+    try testing.expectEqual(url, p.get("url").?.string);
+    try testing.expectEqual(36, p.get("navigation").?.string.len);
+}
+
+fn assertBidiMessage(c: *TestClient, expected: anytype) !void {
+    const msg = try c.readWebsocketMessage() orelse return error.NoMessage;
+    defer if (msg.cleanup_fragment) {
+        c.reader.cleanup();
+    };
+
+    try testing.expectEqual(.text, msg.type);
+    try testing.expectJson(expected, msg.data);
+}
+
 test "server: 404" {
     var c = try createTestClient();
     defer c.deinit();
@@ -722,7 +963,7 @@ fn assertWebSocketError(close_code: u16, input: []const u8) !void {
     var c = try createTestClient();
     defer c.deinit();
 
-    try c.handshake();
+    try c.handshake("/");
     try sys_net.writeAll(c.socket, input);
 
     const msg = try c.readWebsocketMessage() orelse return error.NoMessage;
@@ -739,7 +980,7 @@ fn assertWebSocketMessage(expected: []const u8, input: []const u8) !void {
     var c = try createTestClient();
     defer c.deinit();
 
-    try c.handshake();
+    try c.handshake("/");
     try sys_net.writeAll(c.socket, input);
 
     const msg = try c.readWebsocketMessage() orelse return error.NoMessage;
@@ -801,7 +1042,7 @@ const TestClient = struct {
     buf: [8192]u8 = undefined,
     reader: WS.Reader(false),
 
-    const WS = @import("network/WS.zig");
+    const WS = @import("../network/WS.zig");
 
     fn deinit(self: *TestClient) void {
         _ = std.c.close(self.socket);
@@ -869,9 +1110,9 @@ const TestClient = struct {
         }
     }
 
-    fn handshake(self: *TestClient) !void {
+    fn handshake(self: *TestClient, comptime path: []const u8) !void {
         const request =
-            "GET /   HTTP/1.1\r\n" ++
+            "GET " ++ path ++ "   HTTP/1.1\r\n" ++
             "Connection: upgrade\r\n" ++
             "Upgrade: websocket\r\n" ++
             "sec-websocket-version:13\r\n" ++
@@ -885,16 +1126,35 @@ const TestClient = struct {
             "Sec-Websocket-Accept: flzHu2DevQ2dSCSVqKSii5e9C2o=\r\n\r\n", res);
     }
 
+    // client->server frames must be masked; a zero mask leaves the payload
+    // bytes unchanged.
+    fn bidiCommand(self: *TestClient, payload: []const u8) !void {
+        var frame: [1024]u8 = undefined;
+        frame[0] = 129; // fin | text
+        var header_len: usize = 2;
+        if (payload.len <= 125) {
+            frame[1] = 128 | @as(u8, @intCast(payload.len));
+        } else {
+            frame[1] = 128 | 126;
+            std.mem.writeInt(u16, frame[2..4], @intCast(payload.len), .big);
+            header_len = 4;
+        }
+        @memset(frame[header_len..][0..4], 0);
+        @memcpy(frame[header_len + 4 ..][0..payload.len], payload);
+        try sys_net.writeAll(self.socket, frame[0 .. header_len + 4 + payload.len]);
+    }
+
     fn readWebsocketMessage(self: *TestClient) !?WS.Message {
         while (true) {
+            // two frames can arrive in one read; drain buffered ones first
+            if (try self.reader.next()) |msg| {
+                return msg;
+            }
             const n = try posix.read(self.socket, self.reader.readBuf());
             if (n == 0) {
                 return error.Closed;
             }
             self.reader.len += n;
-            if (try self.reader.next()) |msg| {
-                return msg;
-            }
         }
     }
 };
