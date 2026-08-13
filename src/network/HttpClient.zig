@@ -34,6 +34,7 @@ const http = @import("http.zig");
 const Network = @import("Network.zig");
 const Cache = @import("cache/Cache.zig");
 const RobotsGate = @import("RobotsGate.zig");
+const CorsGate = @import("CorsGate.zig");
 const UrlBlocklist = @import("UrlBlocklist.zig");
 pub const BlockPattern = UrlBlocklist.Pattern;
 
@@ -184,6 +185,7 @@ serve_mode: bool,
 obey_robots: bool,
 
 robots: RobotsGate,
+cors: CorsGate,
 url_blocklist: ?UrlBlocklist,
 
 pub fn init(self: *Client, allocator: Allocator, network: *Network, cdp: ?*CDP) !void {
@@ -226,6 +228,11 @@ pub fn init(self: *Client, allocator: Allocator, network: *Network, cdp: ?*CDP) 
             .network = network,
             .single_flight = .init(allocator),
         },
+        .cors = .{
+            .allocator = allocator,
+            .network = network,
+            .single_flight = .init(allocator),
+        },
         .url_blocklist = url_blocklist,
         .arena_pool = &network.app.arena_pool,
     };
@@ -257,6 +264,7 @@ pub fn deinit(self: *Client) void {
 
     self.clearUrlBlocklist();
     self.robots.deinit();
+    self.cors.deinit();
     self.blocking_requests.deinit(self.allocator);
     self.transfers.deinit(self.allocator);
     self.inbox.deinit();
@@ -426,6 +434,7 @@ pub fn abort(self: *Client) void {
         // - self.robots.pending : each robots fetch's shutdown_callback
         //   drops its entry; parked waiters unlink in their own deinit.
         std.debug.assert(self.robots.single_flight.count() == 0);
+        std.debug.assert(self.cors.single_flight.count() == 0);
     }
 }
 
@@ -853,18 +862,28 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
                 // response came from the cache, we're done
                 return;
             }
-            if (self.obey_robots and !transfer.req.internal) {
-                switch (try self.robots.check(transfer)) {
-                    .allowed => {
-                        lp.metrics.robots_access.incr(.allow);
-                    },
-                    .blocked => {
-                        lp.metrics.robots_access.incr(.deny);
-                        return transfer.failAsync(error.RobotsBlocked);
-                    },
+
+            if (!transfer.req.internal) {
+                if (self.obey_robots) {
+                    switch (try self.robots.check(transfer)) {
+                        .allowed => {
+                            lp.metrics.robots_access.incr(.allow);
+                        },
+                        .blocked => {
+                            lp.metrics.robots_access.incr(.deny);
+                            return transfer.failAsync(error.RobotsBlocked);
+                        },
+                        .pending => {},
+                    }
+                }
+
+                switch (try self.cors.check(transfer)) {
+                    .allowed => {},
+                    .blocked => return transfer.failAsync(error.CorsBlocked),
                     .pending => return,
                 }
             }
+
             continue :sw SubmitFrom.network;
         },
         .network => try self.processTransfer(transfer),
@@ -874,6 +893,11 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
 // RobotsGate resumption. The robots gate is the last step before the
 // network, so an allowed transfer goes straight there.
 pub fn resumeAfterRobots(self: *Client, transfer: *Transfer) !void {
+    return self.pipeline(transfer, .network);
+}
+
+// CorsGate resumption.
+pub fn resumeAfterCors(self: *Client, transfer: *Transfer) !void {
     return self.pipeline(transfer, .network);
 }
 
@@ -2046,6 +2070,9 @@ pub const Transfer = struct {
 
         // RobotsGate holds the transfer pending a robots.txt fetch.
         robots,
+
+        // CorsGAte holds the transfer pending a CORS Preflight.
+        cors,
     };
 
     pub const HeaderResult = enum {
@@ -2081,7 +2108,7 @@ pub const Transfer = struct {
             return;
         }
         switch (self.state.parked) {
-            .robots => {},
+            .robots, .cors => {},
             .intercept_request, .intercept_auth => {
                 lp.assert(self.client.intercepted > 0, "Transfer.leaveIntercept", .{ .value = self.client.intercepted });
                 self.client.intercepted -= 1;
@@ -2152,8 +2179,12 @@ pub const Transfer = struct {
 
         // And for the robots gate: RobotsGate.pending holds a raw *Transfer
         // while we're parked.
-        if (self.state == .parked and self.state.parked == .robots) {
-            self.client.robots.remove(self);
+        if (self.state == .parked) {
+            switch (self.state.parked) {
+                .robots => self.client.robots.remove(self),
+                .cors => self.client.cors.remove(self),
+                .intercept_request, .intercept_auth => {},
+            }
         }
 
         // A pending revalidation entry owns cache resources (possibly an
