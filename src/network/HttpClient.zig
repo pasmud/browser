@@ -896,7 +896,8 @@ pub fn resumeAfterRobots(self: *Client, transfer: *Transfer) !void {
     return self.pipeline(transfer, .network);
 }
 
-// CorsGate resumption.
+// CorsGate resumption. The robots gate is the last step before the
+// network, so an allowed transfer goes straight there.
 pub fn resumeAfterCors(self: *Client, transfer: *Transfer) !void {
     return self.pipeline(transfer, .network);
 }

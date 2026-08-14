@@ -123,13 +123,13 @@ pub fn check(self: *CorsGate, transfer: *Transfer) !Result {
     const arena = try client.arena_pool.acquire(.small, "CorsGate.CorsContext");
     errdefer client.arena_pool.release(arena);
 
-    const key = try keyFor(arena, transfer);
+    const key = try keyFor(arena.allocator(), transfer);
 
     try self.fetchThenResume(arena, key, transfer);
     return .pending;
 }
 
-fn fetchThenResume(self: *CorsGate, arena: Allocator, key: []const u8, transfer: *Transfer) !void {
+fn fetchThenResume(self: *CorsGate, arena: *lp.Arena, key: []const u8, transfer: *Transfer) !void {
     const client = transfer.client;
 
     const res = try self.single_flight.enter(key, transfer, .cors);
@@ -141,9 +141,9 @@ fn fetchThenResume(self: *CorsGate, arena: Allocator, key: []const u8, transfer:
             return;
         },
         .initial => {
-            errdefer self.single_flight.abort(key);
+            // errdefer self.single_flight.abort(key);
 
-            const req_headers = try requestedHeaderNames(arena, transfer);
+            const req_headers = try requestedHeaderNames(arena.allocator(), transfer);
             const cors_ctx = try arena.create(CorsContext);
             cors_ctx.* = .{
                 .gate = self,
@@ -160,11 +160,6 @@ fn fetchThenResume(self: *CorsGate, arena: Allocator, key: []const u8, transfer:
 
             log.debug(.cors, "sending cors preflight", .{ .url = transfer.req.url });
 
-            var headers = try client.newHeaders();
-            errdefer headers.deinit();
-
-            try preflightHeaders(arena, &headers, transfer);
-
             const fetch_transfer = try client.newRequest(.{
                 .url = transfer.req.url,
                 .method = .OPTIONS,
@@ -176,12 +171,13 @@ fn fetchThenResume(self: *CorsGate, arena: Allocator, key: []const u8, transfer:
                 .cookie_jar = null,
                 .cookie_origin = transfer.req.cookie_origin,
                 .ctx = cors_ctx,
-                .headers = headers,
                 .header_callback = CorsContext.headerCallback,
                 .done_callback = CorsContext.doneCallback,
                 .error_callback = CorsContext.errorCallback,
                 .shutdown_callback = CorsContext.shutdownCallback,
             }, null);
+
+            try preflightHeaders(arena.allocator(), transfer);
 
             fetch_transfer.submit() catch {};
         },
@@ -201,13 +197,12 @@ fn requestedHeaderNames(arena: Allocator, transfer: *Transfer) ![]const []const 
     return names.items;
 }
 
-fn preflightHeaders(arena: Allocator, headers: *http.Headers, transfer: *Transfer) !void {
-    try headers.add(try std.fmt.allocPrintSentinel(
-        arena,
-        "Access-Control-Request-Method: {s}",
-        .{@tagName(transfer.req.method)},
-        0,
-    ));
+fn preflightHeaders(arena: Allocator, transfer: *Transfer) !void {
+    try transfer.addHeader(
+        "Access-Control-Request-Method",
+        @tagName(transfer.req.method),
+        .{},
+    );
 
     // Non-safelisted request headers must be listed too, comma-separated,
     // per the Fetch spec's preflight algorithm.
@@ -224,20 +219,14 @@ fn preflightHeaders(arena: Allocator, headers: *http.Headers, transfer: *Transfe
     }
 
     if (names.items.len > 0) {
-        try headers.add(try std.fmt.allocPrintSentinel(
-            arena,
-            "Access-Control-Request-Headers: {s}",
-            .{names.items},
-            0,
-        ));
+        try transfer.addHeader(
+            "Access-Control-Request-Headers",
+            names.items,
+            .{},
+        );
     }
 
-    try headers.add(try std.fmt.allocPrintSentinel(
-        arena,
-        "Origin: {s}",
-        .{transfer.req.cookie_origin},
-        0,
-    ));
+    try transfer.addHeader("Origin", transfer.req.cookie_origin, .{});
 }
 
 pub const CorsEntry = struct {
@@ -359,7 +348,7 @@ pub const CorsEntry = struct {
 
 const CorsContext = struct {
     gate: *CorsGate,
-    arena: Allocator,
+    arena: *lp.Arena,
     arena_pool: *ArenaPool,
     key: []const u8,
     status: u16 = 0,
@@ -378,7 +367,7 @@ const CorsContext = struct {
             self.status = hdr.status;
         }
 
-        self.entry = try CorsEntry.parse(self.arena, transfer);
+        self.entry = try CorsEntry.parse(self.arena.allocator(), transfer);
         return .proceed;
     }
 
@@ -395,13 +384,13 @@ const CorsContext = struct {
             entry.satisfies(self.req_origin, self.req_method, self.req_headers, self.req_credentials);
 
         if (!allowed) {
-            const req_headers_str = std.mem.join(self.arena, ", ", self.req_headers) catch "(oom)";
-            const allow_headers_str = std.mem.join(self.arena, ", ", entry.headers) catch "(oom)";
+            const req_headers_str = std.mem.join(self.arena.allocator(), ", ", self.req_headers) catch "(oom)";
+            const allow_headers_str = std.mem.join(self.arena.allocator(), ", ", entry.headers) catch "(oom)";
             const allow_methods_str = blk: {
                 var buf: std.ArrayList(u8) = .empty;
                 for (entry.methods, 0..) |m, i| {
-                    if (i != 0) buf.appendSlice(self.arena, ", ") catch break :blk "(oom)";
-                    buf.appendSlice(self.arena, @tagName(m)) catch break :blk "(oom)";
+                    if (i != 0) buf.appendSlice(self.arena.allocator(), ", ") catch break :blk "(oom)";
+                    buf.appendSlice(self.arena.allocator(), @tagName(m)) catch break :blk "(oom)";
                 }
                 break :blk buf.items;
             };
@@ -438,17 +427,15 @@ const CorsContext = struct {
         log.debug(.cors, "cors preflight shutdown", .{});
         const gate = self.gate;
         const pool = self.arena_pool;
-        const arena = self.arena;
         gate.single_flight.discard(self.key);
-        pool.release(arena);
+        pool.release(self.arena);
     }
 
     fn resolve(self: *CorsContext, allowed: bool) void {
         const gate = self.gate;
         const pool = self.arena_pool;
-        const arena = self.arena;
         gate.flushPending(self.key, allowed);
-        pool.release(arena);
+        pool.release(self.arena);
     }
 };
 
