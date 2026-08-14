@@ -100,7 +100,10 @@ fn httpHeaderValidator(allocator: Allocator, args: *std.process.Args.Iterator, l
         }
     }
 
-    try list.append(allocator, header);
+    try list.append(allocator, .{
+        .name = try allocator.dupe(u8, header.name),
+        .value = try allocator.dupe(u8, header.value),
+    });
 }
 
 const Cert = struct {
