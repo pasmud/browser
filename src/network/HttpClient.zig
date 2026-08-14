@@ -3587,13 +3587,16 @@ test "HttpClient: seedHeaders applies --http-header extras with override" {
     const headers = transfer.req_headers.items;
     try testing.expectEqual(4, headers.len);
     try testing.expectEqual("User-Agent", headers[0].name);
+    try testing.expectEqual(.user_agent, headers[0].source);
     try testing.expectEqual("Sec-Ch-Ua", headers[1].name);
+    try testing.expectEqual(.fixed, headers[1].source);
     // Baseline Accept-Language replaced in place by the CLI header.
     try testing.expectEqual("Accept-Language", headers[2].name);
     try testing.expectEqual("fr-FR", headers[2].value);
-    try testing.expectEqual(.user_agent, headers[2].source);
+    try testing.expectEqual(.cli, headers[2].source);
     try testing.expectEqual("x-extra", headers[3].name);
     try testing.expectEqual("1", headers[3].value);
+    try testing.expectEqual(.cli, headers[3].source);
 }
 
 test "HttpClient: Transfer.appendHeader joins values by case-insensitive name" {
