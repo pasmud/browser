@@ -2731,7 +2731,8 @@ pub const Transfer = struct {
     // Who put the header on the request. CORS cares: only non-safelisted
     // author (i.e. script-set) headers trigger a preflight.
     // fixed is hardcoded and can't be changed.
-    pub const HeaderSource = enum { user_agent, author, fixed };
+    // cli is set by the CLI and can't be changed.
+    pub const HeaderSource = enum { user_agent, author, fixed, cli };
 
     pub const HeaderOpts = struct {
         source: HeaderSource = .user_agent,
@@ -2782,6 +2783,11 @@ pub const Transfer = struct {
                 log.info(.http, "ignore overriding fixed header", .{ .header = hdr.name });
                 return;
             }
+            // Don't override any cli header.
+            if (hdr.source == .cli) {
+                log.info(.http, "ignore overriding CLI header", .{ .header = hdr.name });
+                return;
+            }
 
             if (found) {
                 _ = self.req_headers.orderedRemove(i);
@@ -2813,6 +2819,11 @@ pub const Transfer = struct {
                 log.info(.http, "ignore overriding fixed header", .{ .header = hdr.name });
                 return;
             }
+            // Don't override any cli header.
+            if (hdr.source == .cli) {
+                log.info(.http, "ignore overriding CLI header", .{ .header = hdr.name });
+                return;
+            }
 
             hdr.value = try std.fmt.allocPrint(self.arena.allocator(), "{s}, {s}", .{ hdr.value, value });
             hdr.source = opts.source;
@@ -2830,7 +2841,7 @@ pub const Transfer = struct {
         // --http-header extras; setHeader so a same-name header (e.g.
         // Accept-Language) overrides the baseline instead of duplicating.
         for (self.client.network.config.httpHeaders()) |hdr| {
-            try self.setHeader(hdr.name, hdr.value, .{});
+            try self.setHeader(hdr.name, hdr.value, .{ .source = .cli });
         }
     }
 
