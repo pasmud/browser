@@ -761,6 +761,8 @@ test "server: bidi errors" {
 }
 
 test "server: bidi browsingContext" {
+    testing.silenceLog(&.{.not_implemented});
+
     var c = try createTestClient();
     defer c.deinit();
     try c.handshake("/session");
